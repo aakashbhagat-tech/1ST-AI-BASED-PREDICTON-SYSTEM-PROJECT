@@ -139,6 +139,8 @@ def generate_gnn_lstm_realtime_snapshot(city="San Francisco", horizon_mins=30, z
     graph_centrality = adjacency.sum(axis=0)
     neighbor_signal = adjacency @ local_signal
     hybrid_signal = (0.68 * local_signal) + (0.32 * neighbor_signal)
+    centrality_norm = graph_centrality / max(np.max(graph_centrality), 1e-9)
+    neighbor_norm = neighbor_signal / max(np.max(neighbor_signal), 1e-9)
 
     records = []
     for idx, row in zones_df.iterrows():
@@ -162,7 +164,7 @@ def generate_gnn_lstm_realtime_snapshot(city="San Francisco", horizon_mins=30, z
                 "confidence": round(confidence[idx], 3),
                 "model_name": "GNN+LSTM",
                 "gnn_neighbor_influence": round(float(neighbor_signal[idx]), 2),
-                "gnn_graph_score": round(float(graph_centrality[idx]), 3),
+                "gnn_graph_score": round(float((0.58 * centrality_norm[idx]) + (0.42 * neighbor_norm[idx])), 3),
                 "gnn_neighbors": ",".join(neighbor_ids.get(row["zone_id"], [])),
                 "data_last_updated": generated_at.isoformat(),
                 "forecast_for": forecast_time.isoformat(),

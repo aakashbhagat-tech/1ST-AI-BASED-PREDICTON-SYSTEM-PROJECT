@@ -76,6 +76,8 @@ const horizonSelect = document.getElementById("horizon-select");
 const intervalSelect = document.getElementById("interval-select");
 const zoneSelect = document.getElementById("zone-select");
 const chartMetricSelect = document.getElementById("chart-metric-select");
+const gnnOverlayToggle = document.getElementById("gnn-overlay-toggle");
+const gnnStatus = document.getElementById("gnn-status");
 
 // City center coordinates (for map centering)
 const cityCenters = {
@@ -92,6 +94,7 @@ const cityNameMap = {
 };
 
 let currentMarkers = [];
+let currentGraphEdges = [];
 let websocket = null;
 let isStreaming = false;
 let connectionRetryTimer = null;
@@ -99,6 +102,7 @@ let mockIntervalTimer = null;
 let usingLocalMock = false;
 let manualStopRequested = false;
 const localMockState = {};
+let latestCityCenter = cityCenters.SF;
 
 function setLoadingState(isVisible, message = "Connecting...") {
   if (!loadingOverlay) return;
@@ -195,6 +199,10 @@ function buildLocalMockMessage(cityCode, horizon, interval) {
     const fleet = Math.max(1, Math.round(predicted / 1.5));
     const level = predicted > 25 ? "High" : predicted > 12 ? "Medium" : "Low";
     const conf = Math.max(0.62, Math.min(0.93, 0.84 - Math.abs(predicted - neighborInfluence) / 180));
+    const graphScore = Math.max(
+      0,
+      Math.min(1, 0.6 * (neighborInfluence / Math.max(predicted, 1)) + 0.4 * conf),
+    );
 
     return {
       zone_id: z.zone_id,
@@ -206,7 +214,7 @@ function buildLocalMockMessage(cityCode, horizon, interval) {
       confidence: Number(conf.toFixed(3)),
       model_name: "GNN+LSTM+Realtime",
       gnn_neighbor_influence: Number(neighborInfluence.toFixed(2)),
-      gnn_graph_score: Number((n.length / 4).toFixed(3)),
+      gnn_graph_score: Number(graphScore.toFixed(3)),
       gnn_neighbors: n.map((x) => zones[x.idx].zone_id).join(","),
       realtime_adjusted: true,
       data_last_updated: now.toISOString(),
@@ -241,6 +249,88 @@ function buildLocalMockMessage(cityCode, horizon, interval) {
 function clearMapMarkers() {
   currentMarkers.forEach((marker) => map.removeLayer(marker));
   currentMarkers = [];
+}
+
+function clearGraphOverlay() {
+  currentGraphEdges.forEach((edge) => map.removeLayer(edge));
+  currentGraphEdges = [];
+}
+
+function computeNearestNeighbors(zones, k = 3) {
+  const neighborMap = {};
+  zones.forEach((a, i) => {
+    const scored = zones
+      .map((b, j) => {
+        if (i === j) return null;
+        const dx = (a.lat || 0) - (b.lat || 0);
+        const dy = (a.lon || 0) - (b.lon || 0);
+        return { id: b.zone_id, dist: Math.sqrt(dx * dx + dy * dy) };
+      })
+      .filter(Boolean)
+      .sort((x, y) => x.dist - y.dist)
+      .slice(0, k)
+      .map((x) => x.id);
+    neighborMap[a.zone_id] = scored;
+  });
+  return neighborMap;
+}
+
+function drawGnnOverlay(zones) {
+  clearGraphOverlay();
+  const overlayOn = !gnnOverlayToggle || gnnOverlayToggle.value === "on";
+  if (!overlayOn || !zones || zones.length === 0) {
+    if (gnnStatus) {
+      gnnStatus.innerText = overlayOn ? "No graph data yet" : "Overlay disabled";
+    }
+    return;
+  }
+
+  const zoneMap = {};
+  zones.forEach((z) => {
+    zoneMap[z.zone_id] = z;
+  });
+
+  const inferred = computeNearestNeighbors(zones, 3);
+  const drawn = new Set();
+  let edgeCount = 0;
+
+  zones.forEach((z) => {
+    const raw = typeof z.gnn_neighbors === "string" ? z.gnn_neighbors : "";
+    const ids = raw
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => x.length > 0);
+    const neighbors = ids.length > 0 ? ids : inferred[z.zone_id] || [];
+
+    neighbors.forEach((nid) => {
+      const n = zoneMap[nid];
+      if (!n) return;
+      const key = [z.zone_id, nid].sort().join("|");
+      if (drawn.has(key)) return;
+      drawn.add(key);
+
+      const influence = Number(z.gnn_neighbor_influence || 0);
+      const weightOpacity = Math.max(0.18, Math.min(0.65, 0.2 + influence / 120));
+      const polyline = L.polyline(
+        [
+          [z.lat || latestCityCenter[0], z.lon || latestCityCenter[1]],
+          [n.lat || latestCityCenter[0], n.lon || latestCityCenter[1]],
+        ],
+        {
+          color: "#f6a623",
+          weight: 2,
+          opacity: weightOpacity,
+          dashArray: "4,6",
+        },
+      ).addTo(map);
+      currentGraphEdges.push(polyline);
+      edgeCount += 1;
+    });
+  });
+
+  if (gnnStatus) {
+    gnnStatus.innerText = `Loaded: ${zones.length} nodes / ${edgeCount} edges`;
+  }
 }
 
 function syncZoneSelector(zones) {
@@ -315,11 +405,7 @@ function addStreamSnapshot(zones, timestamp) {
   latestZones = zones;
   syncZoneSelector(zones);
 
-  const label = new Date(timestamp || Date.now()).toLocaleTimeString();
-  chartTimestamps.push(label);
-  if (chartTimestamps.length > maxChartPoints) {
-    chartTimestamps.shift();
-  }
+  const snapshotTime = new Date(timestamp || Date.now());
 
   const avgDemand =
     zones.length > 0
@@ -331,6 +417,42 @@ function addStreamSnapshot(zones, timestamp) {
       : 0;
   const avgGraphScore =
     zones.length > 0 ? zones.reduce((sum, z) => sum + Number(z.gnn_graph_score || 0), 0) / zones.length : 0;
+
+  // Bootstrap a short history on first packet so the graph shows a trend line,
+  // not a single isolated point.
+  if (chartTimestamps.length === 0) {
+    const bootstrapPoints = 8;
+    for (let i = bootstrapPoints; i >= 1; i--) {
+      const t = new Date(snapshotTime.getTime() - i * 5000);
+      const factor = 1 - i * 0.02;
+      chartTimestamps.push(t.toLocaleTimeString());
+      avgHistory.demand.push(Math.max(0, Math.round(avgDemand * factor)));
+      avgHistory.gnn_influence.push(Number(Math.max(0, avgInfluence * factor).toFixed(3)));
+      avgHistory.graph_score.push(Number(Math.max(0, avgGraphScore * factor).toFixed(3)));
+      zones.forEach((z) => {
+        const zoneId = z.zone_id;
+        if (!zoneSeriesHistory[zoneId]) {
+          zoneSeriesHistory[zoneId] = {
+            demand: [],
+            gnn_influence: [],
+            graph_score: [],
+          };
+        }
+        zoneSeriesHistory[zoneId].demand.push(Math.max(0, Math.round(Number(z.predicted_demand || 0) * factor)));
+        zoneSeriesHistory[zoneId].gnn_influence.push(
+          Number(Math.max(0, Number(z.gnn_neighbor_influence || 0) * factor).toFixed(3)),
+        );
+        zoneSeriesHistory[zoneId].graph_score.push(
+          Number(Math.max(0, Number(z.gnn_graph_score || 0) * factor).toFixed(3)),
+        );
+      });
+    }
+  }
+
+  chartTimestamps.push(snapshotTime.toLocaleTimeString());
+  if (chartTimestamps.length > maxChartPoints) {
+    chartTimestamps.shift();
+  }
 
   avgHistory.demand.push(avgDemand);
   avgHistory.gnn_influence.push(Number(avgInfluence.toFixed(3)));
@@ -440,6 +562,7 @@ function startRealtimeStream() {
   const interval = parseInt(intervalSelect.value, 10);
   manualStopRequested = false;
   resetTrendHistory();
+  latestCityCenter = center;
 
   map.flyTo(center, 12, { duration: 1.2 });
 
@@ -509,6 +632,10 @@ function stopRealtimeStream() {
   isStreaming = false;
   generateBtn.innerText = "Generate Forecast";
   setLoadingState(false);
+  clearGraphOverlay();
+  if (gnnStatus) {
+    gnnStatus.innerText = "Stopped";
+  }
 }
 
 function updateDashboardFromStream(message, cityCenter) {
@@ -533,6 +660,8 @@ function updateDashboardFromStream(message, cityCenter) {
     const updatedAt = z.data_last_updated || message.timestamp;
     const sourceTag = z.source || "mock_realtime";
 
+    const gnnInfluence = Number(z.gnn_neighbor_influence || (z.predicted_demand || 0) * 0.55);
+    const gnnGraphScore = Number(z.gnn_graph_score || Math.min(1, 0.4 + gnnInfluence / 120));
     const color = level === "high" ? "#ff4757" : level === "medium" ? "#ffa502" : "#2ed573";
     const opacity = level === "high" ? 0.6 : 0.4;
 
@@ -555,10 +684,10 @@ function updateDashboardFromStream(message, cityCenter) {
           Demand Level: <strong>${z.demand_level}</strong>
         </div>
         <div style="color:#555">
-          GNN Influence: <strong>${(z.gnn_neighbor_influence || 0).toFixed(2)}</strong>
+          GNN Influence: <strong>${gnnInfluence.toFixed(2)}</strong>
         </div>
         <div style="color:#555">
-          Graph Score: <strong>${(z.gnn_graph_score || 0).toFixed(3)}</strong>
+          Graph Score: <strong>${gnnGraphScore.toFixed(3)}</strong>
         </div>
         <div style="color:#999; font-size:0.8rem; margin-top:5px">
           Updated: ${updatedAt}
@@ -576,11 +705,13 @@ function updateDashboardFromStream(message, cityCenter) {
         <td>${z.zone_id}</td>
         <td><span class="badge ${level}">${z.predicted_demand} trips</span></td>
         <td>${fleet}</td>
-        <td>${(z.gnn_neighbor_influence || 0).toFixed(2)}</td>
+        <td>${gnnInfluence.toFixed(2)}</td>
       `;
       tbody.appendChild(tr);
     }
   });
+
+  drawGnnOverlay(zones);
 
   animateKPI(kpiDemand, kpis.total_demand || 0);
   animateKPI(kpiHotspots, kpis.hotspots || 0);
@@ -626,6 +757,12 @@ if (chartMetricSelect) {
   chartMetricSelect.addEventListener("change", () => {
     setChartStyleByMetric();
     refreshTrendChart();
+  });
+}
+
+if (gnnOverlayToggle) {
+  gnnOverlayToggle.addEventListener("change", () => {
+    drawGnnOverlay(latestZones);
   });
 }
 

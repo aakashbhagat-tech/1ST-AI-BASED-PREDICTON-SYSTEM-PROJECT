@@ -54,6 +54,13 @@
               <option value="300">Every 5 Minutes</option>
             </select>
           </div>
+          <div class="control-group">
+            <label>GNN Graph Overlay</label>
+            <select id="gnn-overlay-toggle">
+              <option value="on" selected>Enabled</option>
+              <option value="off">Disabled</option>
+            </select>
+          </div>
           <button id="generate-btn" class="glow-btn">Generate Forecast</button>
         </div>
 
@@ -64,6 +71,8 @@
           </p>
           <p class="status-label" style="margin-top: 0.8rem;">Update Interval</p>
           <p class="status-value" id="interval-status">Every 3 Minutes</p>
+          <p class="status-label" style="margin-top: 0.8rem;">GNN Status</p>
+          <p class="status-value" id="gnn-status">Waiting for stream...</p>
         </div>
       </aside>
 
@@ -131,7 +140,7 @@
             <div style="display:flex; gap:0.6rem;">
               <select id="chart-metric-select" class="clean-select">
                 <option value="demand">Demand</option>
-                <option value="gnn_influence">GNN Influence</option>
+                <option value="gnn_influence" selected>GNN Influence</option>
                 <option value="graph_score">Graph Score</option>
               </select>
               <select id="zone-select" class="clean-select">
